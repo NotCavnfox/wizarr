@@ -1,21 +1,38 @@
-# Nightly: rebase the patch-overlay onto the latest upstream release, open a PR.
+# Nightly: rebase our patch-overlay onto the latest SAFE upstream release.
+#
+# "Safe release" = the most recent PUBLISHED, NON-prerelease GitHub Release on
+# upstream — never a branch HEAD, never an RC/beta/preview tag. The merge itself
+# is gated by branch protection (build-test must be green), so a sync only lands
+# when it both rebases cleanly AND passes CI.
+#
+# Outcomes:
+#   - already up to date  → no-op, green run.
+#   - clean rebase        → push branch, open/refresh an `upstream-sync` PR.
+#   - rebase conflicts    → NOT auto-applied; open/refresh a tracking issue
+#                           labelled `upstream-sync-conflict` and FAIL the run
+#                           so it's visible (never silently swallowed).
+#
+# Patch-overlay contract: keep the default branch a small set of commits on top
+# of upstream so this rebase stays cheap.
 name: fork-sync-upstream
 
 on:
   schedule:
-    - cron: "17 6 * * *"
+    - cron: "17 6 * * *"   # 06:17 UTC daily
   workflow_dispatch:
     inputs:
       upstream_ref:
-        description: "Upstream ref to rebase onto (default: latest release tag)"
+        description: "Override target ref (default: latest stable upstream release)"
         required: false
         default: ""
 
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 
 env:
+  UPSTREAM_REPO: wizarrrr/wizarr
   UPSTREAM_URL: https://github.com/wizarrrr/wizarr.git
   BASE_BRANCH: main
 
@@ -26,44 +43,88 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - name: Configure git
         run: |
           git config user.name "fork-sync-bot"
           git config user.email "fork-sync-bot@users.noreply.github.com"
+
       - name: Fetch upstream
         run: |
           git remote add upstream "$UPSTREAM_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_URL"
-          git fetch upstream --tags --prune
-      - name: Resolve target ref
+          git fetch upstream --tags --prune --force
+
+      - name: Resolve latest SAFE release
         id: target
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           REF="${{ github.event.inputs.upstream_ref }}"
           if [ -z "$REF" ]; then
-            REF=$(git tag -l --sort=-v:refname | grep -E '^v?[0-9]' | head -n1)
-            [ -z "$REF" ] && REF="upstream/HEAD"
+            # Latest published, non-prerelease, non-draft release tag from upstream.
+            REF=$(gh release list --repo "$UPSTREAM_REPO" --exclude-drafts --exclude-pre-releases \
+                    --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
+          fi
+          if [ -z "$REF" ]; then
+            echo "::error::Could not resolve a stable upstream release for $UPSTREAM_REPO"
+            exit 1
           fi
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
-          echo "branch=sync/upstream-$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          echo "branch=sync/upstream-$REF" >> "$GITHUB_OUTPUT"
+          echo "Target safe release: $REF"
+
+      - name: Skip if already synced
+        id: gate
+        run: |
+          # If the release tag is already an ancestor of our base branch, nothing to do.
+          if git merge-base --is-ancestor "${{ steps.target.outputs.ref }}" "origin/$BASE_BRANCH" 2>/dev/null; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "Already contains ${{ steps.target.outputs.ref }} — nothing to sync."
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Rebase patch-overlay
         id: rebase
+        if: steps.gate.outputs.up_to_date != 'true'
         run: |
-          git checkout -B "${{ steps.target.outputs.branch }}"
+          git checkout -B "${{ steps.target.outputs.branch }}" "origin/$BASE_BRANCH"
           if git rebase "${{ steps.target.outputs.ref }}"; then
             echo "status=clean" >> "$GITHUB_OUTPUT"
           else
             git rebase --abort || true
             echo "status=conflict" >> "$GITHUB_OUTPUT"
           fi
-      - name: Open PR
+
+      - name: Open / refresh sync PR (clean rebase)
+        if: steps.gate.outputs.up_to_date != 'true' && steps.rebase.outputs.status == 'clean'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git push -f origin "${{ steps.target.outputs.branch }}"
-          BODY="Automated upstream sync onto \`${{ steps.target.outputs.ref }}\`."
-          if [ "${{ steps.rebase.outputs.status }}" = "conflict" ]; then
-            BODY="$BODY\n\n:warning: Rebase hit conflicts — resolve manually before merge."
-          fi
           gh pr create --base "$BASE_BRANCH" --head "${{ steps.target.outputs.branch }}" \
             --title "sync: upstream ${{ steps.target.outputs.ref }}" \
-            --body "$(printf '%b' "$BODY")" \
-            --label "upstream-sync" || echo "PR may already exist"
+            --body "Automated rebase of our patch-overlay onto safe release \`${{ steps.target.outputs.ref }}\`. Merges only once \`build-test\` is green." \
+            --label "upstream-sync" \
+            || echo "PR already open for ${{ steps.target.outputs.branch }}"
+
+      - name: Surface conflict as a tracking issue (and fail)
+        if: steps.gate.outputs.up_to_date != 'true' && steps.rebase.outputs.status == 'conflict'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="sync conflict: upstream ${{ steps.target.outputs.ref }}"
+          EXISTING=$(gh issue list --label upstream-sync-conflict --state open \
+                       --search "$TITLE in:title" --json number -q '.[0].number' 2>/dev/null || true)
+          BODY=$(printf 'The nightly upstream sync could not rebase our patch-overlay onto the safe release `%s` cleanly — manual resolution needed.\n\nReproduce locally:\n```\ngit fetch upstream --tags\ngit checkout -B sync/upstream-%s origin/%s\ngit rebase %s\n# resolve conflicts, then open a PR against %s\n```\n' \
+            "${{ steps.target.outputs.ref }}" "${{ steps.target.outputs.ref }}" "$BASE_BRANCH" "${{ steps.target.outputs.ref }}" "$BASE_BRANCH")
+          if [ -n "$EXISTING" ]; then
+            echo "Conflict issue #$EXISTING already open — leaving a note."
+            gh issue comment "$EXISTING" --body "Still conflicting as of $(date -u +%F)."
+          else
+            gh issue create --title "$TITLE" --label upstream-sync-conflict --body "$BODY" \
+              || gh label create upstream-sync-conflict --color B60205 --description "Upstream sync needs manual rebase" \
+                 && gh issue create --title "$TITLE" --label upstream-sync-conflict --body "$BODY"
+          fi
+          echo "::error::Rebase onto ${{ steps.target.outputs.ref }} conflicts — see the upstream-sync-conflict issue."
+          exit 1
