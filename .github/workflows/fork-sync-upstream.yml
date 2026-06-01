@@ -101,8 +101,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # --repo is required: the runner has an `upstream` remote, so a bare
+          # gh would resolve to the UPSTREAM repo instead of this fork.
           git push -f origin "${{ steps.target.outputs.branch }}"
-          gh pr create --base "$BASE_BRANCH" --head "${{ steps.target.outputs.branch }}" \
+          gh pr create --repo "$GITHUB_REPOSITORY" \
+            --base "$BASE_BRANCH" --head "${{ steps.target.outputs.branch }}" \
             --title "sync: upstream ${{ steps.target.outputs.ref }}" \
             --body "Automated rebase of our patch-overlay onto safe release \`${{ steps.target.outputs.ref }}\`. Merges only once \`build-test\` is green." \
             --label "upstream-sync" \
@@ -113,18 +116,23 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # --repo is required everywhere: the runner has an `upstream` remote,
+          # so a bare gh would target the UPSTREAM repo (403 / wrong repo).
+          # Requires Issues enabled on the fork (forks default to disabled).
+          REPO="$GITHUB_REPOSITORY"
           TITLE="sync conflict: upstream ${{ steps.target.outputs.ref }}"
-          EXISTING=$(gh issue list --label upstream-sync-conflict --state open \
-                       --search "$TITLE in:title" --json number -q '.[0].number' 2>/dev/null || true)
+          # Ensure the label exists (idempotent) before using it.
+          gh label create upstream-sync-conflict --repo "$REPO" \
+            --color B60205 --description "Upstream sync needs manual rebase" --force || true
           BODY=$(printf 'The nightly upstream sync could not rebase our patch-overlay onto the safe release `%s` cleanly — manual resolution needed.\n\nReproduce locally:\n```\ngit fetch upstream --tags\ngit checkout -B sync/upstream-%s origin/%s\ngit rebase %s\n# resolve conflicts, then open a PR against %s\n```\n' \
             "${{ steps.target.outputs.ref }}" "${{ steps.target.outputs.ref }}" "$BASE_BRANCH" "${{ steps.target.outputs.ref }}" "$BASE_BRANCH")
+          EXISTING=$(gh issue list --repo "$REPO" --label upstream-sync-conflict --state open \
+                       --search "$TITLE in:title" --json number -q '.[0].number' 2>/dev/null || true)
           if [ -n "$EXISTING" ]; then
             echo "Conflict issue #$EXISTING already open — leaving a note."
-            gh issue comment "$EXISTING" --body "Still conflicting as of $(date -u +%F)."
+            gh issue comment "$EXISTING" --repo "$REPO" --body "Still conflicting as of $(date -u +%F)."
           else
-            gh issue create --title "$TITLE" --label upstream-sync-conflict --body "$BODY" \
-              || gh label create upstream-sync-conflict --color B60205 --description "Upstream sync needs manual rebase" \
-                 && gh issue create --title "$TITLE" --label upstream-sync-conflict --body "$BODY"
+            gh issue create --repo "$REPO" --title "$TITLE" --label upstream-sync-conflict --body "$BODY"
           fi
           echo "::error::Rebase onto ${{ steps.target.outputs.ref }} conflicts — see the upstream-sync-conflict issue."
           exit 1
