@@ -4,6 +4,9 @@ name: fork-release
 on:
   push:
     tags: ["v*"]
+  # fork-auto-release pushes tags with GITHUB_TOKEN, and token-caused events
+  # never fire on:push — it dispatches this workflow on the tag ref instead.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,6 +18,7 @@ env:
 
 jobs:
   release:
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -1,0 +1,86 @@
+# When the base branch contains the latest stable upstream release but the
+# fork has no matching tag yet: tag HEAD and dispatch fork-release.
+#
+# Why a schedule sweep and not just tag-on-merge: sync PRs are merged by
+# auto-merge under GITHUB_TOKEN, and GITHUB_TOKEN-caused events never trigger
+# workflows. The pull_request trigger below catches *manual* merges instantly;
+# the schedule reliably catches bot merges within 2 hours.
+name: fork-auto-release
+
+on:
+  schedule:
+    - cron: "41 */2 * * *"
+  workflow_dispatch:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  UPSTREAM_REPO: wizarrrr/wizarr
+  BASE_BRANCH: main
+
+jobs:
+  tag-and-release:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || (github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'sync/upstream-'))
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Resolve latest stable upstream release
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REF=$(gh release list --repo "$UPSTREAM_REPO" --exclude-drafts --exclude-pre-releases \
+                  --limit 1 --json tagName -q '.[0].tagName')
+          if [ -z "$REF" ]; then
+            echo "::error::Could not resolve a stable upstream release for $UPSTREAM_REPO"
+            exit 1
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "Latest stable upstream release: $REF"
+
+      - name: Gate — base synced to release and fork not yet tagged?
+        id: gate
+        run: |
+          REF="${{ steps.rel.outputs.ref }}"
+          # Fork already released this version → nothing to do.
+          if git ls-remote --exit-code --tags origin "refs/tags/$REF" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Fork already tagged $REF."
+            exit 0
+          fi
+          # Fetch the upstream tag to a neutral ref so it can't clobber ours.
+          git remote add upstream "https://github.com/$UPSTREAM_REPO.git" 2>/dev/null || true
+          if ! git fetch -q --no-tags upstream "+refs/tags/$REF:refs/upsync/$REF"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream tag $REF not fetchable."
+            exit 0
+          fi
+          if ! git merge-base --is-ancestor "refs/upsync/$REF" HEAD; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Base branch not yet synced to $REF — waiting on fork-sync-upstream."
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Tag and dispatch release build
+        if: steps.gate.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REF="${{ steps.rel.outputs.ref }}"
+          git config user.name "fork-release-bot"
+          git config user.email "fork-release-bot@users.noreply.github.com"
+          git tag -a "$REF" -m "Fork release: upstream $REF + patch overlay" HEAD
+          git push origin "refs/tags/$REF"
+          # Token-pushed tags don't fire on:push — dispatch the build explicitly.
+          gh workflow run fork-release.yml --repo "$GITHUB_REPOSITORY" --ref "$REF"
+          echo "Tagged $REF and dispatched fork-release."

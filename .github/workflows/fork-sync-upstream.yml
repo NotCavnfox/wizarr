@@ -89,27 +89,45 @@ jobs:
         if: steps.gate.outputs.up_to_date != 'true'
         run: |
           git checkout -B "${{ steps.target.outputs.branch }}" "origin/$BASE_BRANCH"
-          if git rebase "${{ steps.target.outputs.ref }}"; then
+          # --empty=drop: overlay commits already absorbed upstream (or duplicated
+          # by an earlier merge-commit sync) vanish instead of halting the rebase.
+          if git rebase --empty=drop "${{ steps.target.outputs.ref }}"; then
             echo "status=clean" >> "$GITHUB_OUTPUT"
           else
             git rebase --abort || true
             echo "status=conflict" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Open / refresh sync PR (clean rebase)
+      - name: Open / refresh sync PR + enable auto-merge (clean rebase)
         if: steps.gate.outputs.up_to_date != 'true' && steps.rebase.outputs.status == 'clean'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           # --repo is required: the runner has an `upstream` remote, so a bare
           # gh would resolve to the UPSTREAM repo instead of this fork.
-          git push -f origin "${{ steps.target.outputs.branch }}"
-          gh pr create --repo "$GITHUB_REPOSITORY" \
-            --base "$BASE_BRANCH" --head "${{ steps.target.outputs.branch }}" \
-            --title "sync: upstream ${{ steps.target.outputs.ref }}" \
-            --body "Automated rebase of our patch-overlay onto safe release \`${{ steps.target.outputs.ref }}\`. Merges only once \`build-test\` is green." \
-            --label "upstream-sync" \
-            || echo "PR already open for ${{ steps.target.outputs.branch }}"
+          REPO="$GITHUB_REPOSITORY"
+          BRANCH="${{ steps.target.outputs.branch }}"
+          git push -f origin "$BRANCH"
+          # The label must exist before `pr create --label` or the whole create
+          # fails — a swallowed version of exactly that error silently blocked
+          # every v3.3.0 sync PR for a week. Create it idempotently, and never
+          # hide gh errors behind `|| echo` again.
+          gh label create upstream-sync --repo "$REPO" \
+            --color 0E8A16 --description "Automated upstream stable-release sync" --force
+PR=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
+       --json number -q '.[0].number // empty')
+            gh pr create --repo "$REPO" \
+              --base "$BASE_BRANCH" --head "$BRANCH" \
+              --title "sync: upstream ${{ steps.target.outputs.ref }}" \
+              --body "Automated rebase of our patch-overlay onto safe release \`${{ steps.target.outputs.ref }}\`. Auto-merges once \`build-test\` is green; fork-auto-release then tags and publishes the image." \
+              --label upstream-sync
+PR=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
+       --json number -q '.[0].number // empty')
+          fi
+          # Routine stable-release syncs are zero-touch: merge when checks pass.
+          # Feature PRs keep the human gate — this only touches sync/upstream-*.
+          gh pr merge "$PR" --repo "$REPO" --auto --merge
 
       - name: Surface conflict as a tracking issue (and fail)
         if: steps.gate.outputs.up_to_date != 'true' && steps.rebase.outputs.status == 'conflict'
