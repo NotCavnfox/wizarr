@@ -5,6 +5,10 @@ on:
   pull_request:
   push:
     branches: [main]
+  # fork-sync-upstream dispatches this on sync branches: PRs created with
+  # GITHUB_TOKEN never fire pull_request workflows, so the required check
+  # would otherwise never report and auto-merge would wait forever.
+  workflow_dispatch:
 
 jobs:
   ci:
