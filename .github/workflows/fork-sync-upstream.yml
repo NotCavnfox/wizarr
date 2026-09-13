@@ -1,8 +1,3 @@
-# Prepare stable upstream sync PRs. An independent agent reviews and merges;
-# publication/deployment side effects must be checked before merging.
-# GITHUB_TOKEN cannot push upstream changes to workflow files. Such a failure
-# needs a separately reviewed publication through an authorized credential;
-# actions: write below permits CI dispatch, not workflow-file modification.
 name: fork-sync-upstream
 
 on:
@@ -11,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       upstream_ref:
-        description: "Published stable vX.Y.Z tag (default: latest stable release)"
+        description: Published stable vX.Y.Z tag (default latest stable)
         required: false
         default: ""
 
@@ -21,165 +16,11 @@ permissions:
   issues: write
   actions: write
 
-concurrency:
-  group: fork-sync-upstream
-  cancel-in-progress: false
-
-env:
-  UPSTREAM_REPO: wizarrrr/wizarr
-  UPSTREAM_URL: https://github.com/wizarrrr/wizarr.git
-  BASE_BRANCH: main
-
 jobs:
   sync:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: main
-          fetch-depth: 0
-
-      - name: Configure git
-        run: |
-          git config user.name "fork-sync-bot"
-          git config user.email "fork-sync-bot@users.noreply.github.com"
-
-      - name: Resolve published stable release and immutable commits
-        id: target
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REQUESTED_REF: ${{ inputs.upstream_ref }}
-        run: |
-          set -euo pipefail
-          # Event input is data, never interpolated into shell source.
-          if [ -n "$REQUESTED_REF" ]; then
-            [[ "$REQUESTED_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-              echo "::error::Expected a published stable vX.Y.Z tag"; exit 1;
-            }
-            RELEASE=$(gh api "repos/$UPSTREAM_REPO/releases/tags/$REQUESTED_REF")
-          else
-            RELEASE=$(gh api "repos/$UPSTREAM_REPO/releases/latest")
-          fi
-          REF=$(jq -er 'select(.draft == false and .prerelease == false and .published_at != null) | .tag_name' <<< "$RELEASE")
-          [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-            echo "::error::Upstream release does not use a stable vX.Y.Z tag"; exit 1;
-          }
-          [ -z "$REQUESTED_REF" ] || [ "$REQUESTED_REF" = "$REF" ]
-          # A neutral ref avoids overwriting fork release tags.
-          git fetch --no-tags "$UPSTREAM_URL" "refs/tags/$REF:refs/upsync/target"
-          UPSTREAM_SHA=$(git rev-parse 'refs/upsync/target^{commit}')
-          BASE_SHA=$(git rev-parse "origin/$BASE_BRANCH^{commit}")
-          BRANCH="sync/upstream-$REF-$BASE_SHA-$UPSTREAM_SHA"
-          printf 'ref=%s\nupstream_sha=%s\nbase_sha=%s\nbranch=%s\n' \
-            "$REF" "$UPSTREAM_SHA" "$BASE_SHA" "$BRANCH" >> "$GITHUB_OUTPUT"
-
-      - name: Skip if already synced
-        id: gate
-        env:
-          UPSTREAM_SHA: ${{ steps.target.outputs.upstream_sha }}
-          BASE_SHA: ${{ steps.target.outputs.base_sha }}
-        run: |
-          set -euo pipefail
-          if git merge-base --is-ancestor "$UPSTREAM_SHA" "$BASE_SHA"; then
-            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
-          else
-            code=$?
-            [ "$code" -eq 1 ] || exit "$code"
-            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Merge stable upstream while preserving fork history
-        id: integrate
-        if: steps.gate.outputs.up_to_date != 'true'
-        env:
-          UPSTREAM_SHA: ${{ steps.target.outputs.upstream_sha }}
-          BASE_SHA: ${{ steps.target.outputs.base_sha }}
-          BRANCH: ${{ steps.target.outputs.branch }}
-        run: |
-          set -euo pipefail
-          git checkout -b "$BRANCH" "$BASE_SHA"
-          if git merge --no-ff --no-edit "$UPSTREAM_SHA"; then
-            echo "status=clean" >> "$GITHUB_OUTPUT"
-          else
-            # Distinguish actual conflicts from other Git failures.
-            CONFLICTS=$(git diff --name-only --diff-filter=U)
-            git merge --abort
-            [ -n "$CONFLICTS" ] || { echo "::error::Merge failed without conflicts"; exit 1; }
-            echo "status=conflict" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Publish or reuse sync PR for independent review
-        if: steps.gate.outputs.up_to_date != 'true' && steps.integrate.outputs.status == 'clean'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REF: ${{ steps.target.outputs.ref }}
-          UPSTREAM_SHA: ${{ steps.target.outputs.upstream_sha }}
-          BASE_SHA: ${{ steps.target.outputs.base_sha }}
-          BRANCH: ${{ steps.target.outputs.branch }}
-        run: |
-          set -euo pipefail
-          REPO="$GITHUB_REPOSITORY"
-          # Merge commits have time-dependent IDs. Reuse a prior branch only
-          # when its source tree matches and it contains both exact parents.
-          REMOTE=$(git ls-remote --heads origin "refs/heads/$BRANCH")
-          if [ -n "$REMOTE" ]; then
-            git fetch --no-tags origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
-            git merge-base --is-ancestor "$UPSTREAM_SHA" "origin/$BRANCH"
-            git merge-base --is-ancestor "$BASE_SHA" "origin/$BRANCH"
-            [ "$(git rev-parse 'HEAD^{tree}')" = "$(git rev-parse "origin/$BRANCH^{tree}")" ] || {
-              echo "::error::Existing sync branch differs; review it without overwriting"; exit 1;
-            }
-          else
-            # Never force-push. Permission errors remain visible and stop here.
-            git push origin "HEAD:refs/heads/$BRANCH"
-          fi
-          gh label create upstream-sync --repo "$REPO" \
-            --color 0E8A16 --description "Automated upstream stable-release sync" --force
-          PRS=$(gh pr list --repo "$REPO" --head "$BRANCH" --base "$BASE_BRANCH" \
-            --state all --json number,state)
-          PR=$(jq -r '[.[] | select(.state == "OPEN")][0].number // empty' <<< "$PRS")
-          if [ -z "$PR" ]; then
-            [ "$(jq length <<< "$PRS")" -eq 0 ] || {
-              echo "A reviewed sync PR was already closed; leaving that decision intact."; exit 0;
-            }
-            BODY=$(printf 'Stable upstream `%s` at `%s`, merged into fork `%s`.\n\nIndependent review and passing CI are required. No automatic merge is requested. Check publication and server-update triggers before merging; server-affecting releases need explicit approval.\n' "$REF" "$UPSTREAM_SHA" "$BASE_SHA")
-            gh pr create --repo "$REPO" --base "$BASE_BRANCH" --head "$BRANCH" \
-              --title "sync: upstream $REF" --body "$BODY" --label upstream-sync
-          fi
-          # Token-created PRs do not trigger pull_request CI. Dispatch on the
-          # published branch; the coordinator must verify the exact PR SHA.
-          PUBLISHED_SHA=$(git ls-remote --heads origin "refs/heads/$BRANCH" | cut -f1)
-          [[ "$PUBLISHED_SHA" =~ ^[0-9a-f]{40}$ ]]
-          RUNS=$(gh run list --repo "$REPO" --workflow fork-build-test.yml \
-            --branch "$BRANCH" --commit "$PUBLISHED_SHA" --limit 20 --json status,conclusion)
-          if jq -e 'any(.[]; .conclusion == "success" or .status != "completed")' <<< "$RUNS" >/dev/null; then
-            echo "CI already passed or is pending for $PUBLISHED_SHA."
-          else
-            gh workflow run fork-build-test.yml --repo "$REPO" --ref "$BRANCH"
-          fi
-
-      - name: Track conflict once and fail visibly
-        if: steps.gate.outputs.up_to_date != 'true' && steps.integrate.outputs.status == 'conflict'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REF: ${{ steps.target.outputs.ref }}
-          UPSTREAM_SHA: ${{ steps.target.outputs.upstream_sha }}
-          BASE_SHA: ${{ steps.target.outputs.base_sha }}
-        run: |
-          set -euo pipefail
-          REPO="$GITHUB_REPOSITORY"
-          TITLE="sync conflict: upstream $REF"
-          gh label create upstream-sync-conflict --repo "$REPO" \
-            --color B60205 --description "Upstream sync needs conflict resolution" --force
-          ISSUES=$(gh issue list --repo "$REPO" --label upstream-sync-conflict \
-            --state open --search "$TITLE in:title" --json number,title --limit 100)
-          EXISTING=$(jq -r --arg title "$TITLE" '[.[] | select(.title == $title)][0].number // empty' <<< "$ISSUES")
-          if [ -z "$EXISTING" ]; then
-            BODY=$(printf 'Stable upstream `%s` (`%s`) conflicts with fork `%s`. Resolve the patch overlay in a reviewed PR.\n\nRun: https://github.com/%s/actions/runs/%s\n' "$REF" "$UPSTREAM_SHA" "$BASE_SHA" "$REPO" "$GITHUB_RUN_ID")
-            gh issue create --repo "$REPO" --title "$TITLE" \
-              --label upstream-sync-conflict --body "$BODY"
-          else
-            echo "Conflict remains tracked in #$EXISTING; no repeated comment."
-          fi
-          echo "::error::Upstream sync requires conflict resolution"
-          exit 1
+    # Replace the marker only with the reviewed, merged shared commit SHA.
+    uses: NotCavnfox/.github/.github/workflows/sync-upstream.yml@8554d67712f5e6565831431a876c6f08e04cdb13
+    with:
+      upstream_repo: wizarrrr/wizarr
+      base_branch: main
+      upstream_ref: ${{ inputs.upstream_ref }}
