@@ -1,4 +1,5 @@
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import frontmatter
 import markdown
@@ -32,6 +33,31 @@ from app.services.ombi_client import run_all_importers
 
 wizard_bp = Blueprint("wizard", __name__, url_prefix="/wizard")
 BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent / "wizard_steps"
+
+
+def _watch_url(external_url: str | None) -> str | None:
+    """Only expose an explicitly configured HTTPS client URL, never the API URL."""
+    if not external_url or any(
+        char.isspace() or ord(char) < 32 for char in external_url
+    ):
+        return None
+    try:
+        parsed = urlsplit(external_url)
+        # Accessing port also validates malformed/out-of-range port values.
+        _ = parsed.port
+        if (
+            parsed.scheme == "https"
+            and parsed.hostname
+            and not parsed.username
+            and not parsed.password
+            and not parsed.query
+            and not parsed.fragment
+            and "\\" not in external_url
+        ):
+            return external_url
+    except ValueError:
+        pass
+    return None
 
 
 # Only allow access right after signup or when logged in
@@ -115,6 +141,11 @@ def _get_server_context(server_type: str) -> dict[str, str | None]:
         context["server_url"] = server.url or ""
         context["server_name"] = getattr(server, "name", "") or ""
         context["server_type"] = server.server_type
+        context["watch_url"] = (
+            _watch_url(server.external_url)
+            if server.server_type == "jellyfin"
+            else None
+        )
     else:
         # Fallback values to prevent template errors
         context["external_url"] = ""
@@ -416,6 +447,13 @@ def _serve_wizard(
         step_phase=display_phase,
         completion_url=completion_url,
         completion_label=completion_label,
+        watch_url=(
+            server_ctx.get("watch_url")
+            if server == "jellyfin"
+            and idx == len(steps) - 1
+            and (phase == "post" or (phase == "preview" and display_phase == "post"))
+            else None
+        ),
         gradient_start=colors["gradient_start"],
         gradient_end=colors["gradient_end"],
         shadow_color=colors["shadow_color"],

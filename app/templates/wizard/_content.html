@@ -10,4 +10,11 @@
   <div class="prose prose-slate dark:prose-invert text-gray-800 dark:text-gray-200 max-w-none prose-sm md:prose-base">
     {{ body_html|safe }}
   </div>
+  {% if watch_url %}
+    <a href="{{ watch_url }}"
+       rel="noreferrer"
+       class="mt-6 inline-block rounded-lg bg-primary px-5 py-3 font-medium text-white">
+      {{ _("Watch in Jellyfin") }}
+    </a>
+  {% endif %}
 </div>
