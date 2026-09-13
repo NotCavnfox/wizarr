@@ -1,28 +1,17 @@
-# Nightly: rebase our patch-overlay onto the latest SAFE upstream release.
-#
-# "Safe release" = the most recent PUBLISHED, NON-prerelease GitHub Release on
-# upstream — never a branch HEAD, never an RC/beta/preview tag. The merge itself
-# is gated by branch protection (build-test must be green), so a sync only lands
-# when it both rebases cleanly AND passes CI.
-#
-# Outcomes:
-#   - already up to date  → no-op, green run.
-#   - clean rebase        → push branch, open/refresh an `upstream-sync` PR.
-#   - rebase conflicts    → NOT auto-applied; open/refresh a tracking issue
-#                           labelled `upstream-sync-conflict` and FAIL the run
-#                           so it's visible (never silently swallowed).
-#
-# Patch-overlay contract: keep the default branch a small set of commits on top
-# of upstream so this rebase stays cheap.
+# Prepare stable upstream sync PRs. An independent agent reviews and merges;
+# publication/deployment side effects must be checked before merging.
+# GITHUB_TOKEN cannot push upstream changes to workflow files. Such a failure
+# needs a separately reviewed publication through an authorized credential;
+# actions: write below permits CI dispatch, not workflow-file modification.
 name: fork-sync-upstream
 
 on:
   schedule:
-    - cron: "17 6 * * *"   # 06:17 UTC daily
+    - cron: "17 6 * * *"
   workflow_dispatch:
     inputs:
       upstream_ref:
-        description: "Override target ref (default: latest stable upstream release)"
+        description: "Published stable vX.Y.Z tag (default: latest stable release)"
         required: false
         default: ""
 
@@ -30,6 +19,11 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
+  actions: write
+
+concurrency:
+  group: fork-sync-upstream
+  cancel-in-progress: false
 
 env:
   UPSTREAM_REPO: wizarrrr/wizarr
@@ -42,6 +36,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
 
       - name: Configure git
@@ -49,113 +44,142 @@ jobs:
           git config user.name "fork-sync-bot"
           git config user.email "fork-sync-bot@users.noreply.github.com"
 
-      - name: Fetch upstream
-        run: |
-          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_URL"
-          git fetch upstream --tags --prune --force
-
-      - name: Resolve latest SAFE release
+      - name: Resolve published stable release and immutable commits
         id: target
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUESTED_REF: ${{ inputs.upstream_ref }}
         run: |
-          REF="${{ github.event.inputs.upstream_ref }}"
-          if [ -z "$REF" ]; then
-            # Latest published, non-prerelease, non-draft release tag from upstream.
-            REF=$(gh release list --repo "$UPSTREAM_REPO" --exclude-drafts --exclude-pre-releases \
-                    --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
+          set -euo pipefail
+          # Event input is data, never interpolated into shell source.
+          if [ -n "$REQUESTED_REF" ]; then
+            [[ "$REQUESTED_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+              echo "::error::Expected a published stable vX.Y.Z tag"; exit 1;
+            }
+            RELEASE=$(gh api "repos/$UPSTREAM_REPO/releases/tags/$REQUESTED_REF")
+          else
+            RELEASE=$(gh api "repos/$UPSTREAM_REPO/releases/latest")
           fi
-          if [ -z "$REF" ]; then
-            echo "::error::Could not resolve a stable upstream release for $UPSTREAM_REPO"
-            exit 1
-          fi
-          echo "ref=$REF" >> "$GITHUB_OUTPUT"
-          echo "branch=sync/upstream-$REF" >> "$GITHUB_OUTPUT"
-          echo "Target safe release: $REF"
+          REF=$(jq -er 'select(.draft == false and .prerelease == false and .published_at != null) | .tag_name' <<< "$RELEASE")
+          [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::Upstream release does not use a stable vX.Y.Z tag"; exit 1;
+          }
+          [ -z "$REQUESTED_REF" ] || [ "$REQUESTED_REF" = "$REF" ]
+          # A neutral ref avoids overwriting fork release tags.
+          git fetch --no-tags "$UPSTREAM_URL" "refs/tags/$REF:refs/upsync/target"
+          UPSTREAM_SHA=$(git rev-parse 'refs/upsync/target^{commit}')
+          BASE_SHA=$(git rev-parse "origin/$BASE_BRANCH^{commit}")
+          BRANCH="sync/upstream-$REF-$BASE_SHA-$UPSTREAM_SHA"
+          printf 'ref=%s\nupstream_sha=%s\nbase_sha=%s\nbranch=%s\n' \
+            "$REF" "$UPSTREAM_SHA" "$BASE_SHA" "$BRANCH" >> "$GITHUB_OUTPUT"
 
       - name: Skip if already synced
         id: gate
+        env:
+          UPSTREAM_SHA: ${{ steps.target.outputs.upstream_sha }}
+          BASE_SHA: ${{ steps.target.outputs.base_sha }}
         run: |
-          # If the release tag is already an ancestor of our base branch, nothing to do.
-          if git merge-base --is-ancestor "${{ steps.target.outputs.ref }}" "origin/$BASE_BRANCH" 2>/dev/null; then
+          set -euo pipefail
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" "$BASE_SHA"; then
             echo "up_to_date=true" >> "$GITHUB_OUTPUT"
-            echo "Already contains ${{ steps.target.outputs.ref }} — nothing to sync."
           else
+            code=$?
+            [ "$code" -eq 1 ] || exit "$code"
             echo "up_to_date=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Rebase patch-overlay
-        id: rebase
+      - name: Merge stable upstream while preserving fork history
+        id: integrate
         if: steps.gate.outputs.up_to_date != 'true'
+        env:
+          UPSTREAM_SHA: ${{ steps.target.outputs.upstream_sha }}
+          BASE_SHA: ${{ steps.target.outputs.base_sha }}
+          BRANCH: ${{ steps.target.outputs.branch }}
         run: |
-          git checkout -B "${{ steps.target.outputs.branch }}" "origin/$BASE_BRANCH"
-          # --empty=drop: overlay commits already absorbed upstream (or duplicated
-          # by an earlier merge-commit sync) vanish instead of halting the rebase.
-          if git rebase --empty=drop "${{ steps.target.outputs.ref }}"; then
+          set -euo pipefail
+          git checkout -b "$BRANCH" "$BASE_SHA"
+          if git merge --no-ff --no-edit "$UPSTREAM_SHA"; then
             echo "status=clean" >> "$GITHUB_OUTPUT"
           else
-            git rebase --abort || true
+            # Distinguish actual conflicts from other Git failures.
+            CONFLICTS=$(git diff --name-only --diff-filter=U)
+            git merge --abort
+            [ -n "$CONFLICTS" ] || { echo "::error::Merge failed without conflicts"; exit 1; }
             echo "status=conflict" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Open / refresh sync PR + enable auto-merge (clean rebase)
-        if: steps.gate.outputs.up_to_date != 'true' && steps.rebase.outputs.status == 'clean'
+      - name: Publish or reuse sync PR for independent review
+        if: steps.gate.outputs.up_to_date != 'true' && steps.integrate.outputs.status == 'clean'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF: ${{ steps.target.outputs.ref }}
+          UPSTREAM_SHA: ${{ steps.target.outputs.upstream_sha }}
+          BASE_SHA: ${{ steps.target.outputs.base_sha }}
+          BRANCH: ${{ steps.target.outputs.branch }}
         run: |
           set -euo pipefail
-          # --repo is required: the runner has an `upstream` remote, so a bare
-          # gh would resolve to the UPSTREAM repo instead of this fork.
           REPO="$GITHUB_REPOSITORY"
-          BRANCH="${{ steps.target.outputs.branch }}"
-          git push -f origin "$BRANCH"
-          # The label must exist before `pr create --label` or the whole create
-          # fails — a swallowed version of exactly that error silently blocked
-          # every v3.3.0 sync PR for a week. Create it idempotently, and never
-          # hide gh errors behind `|| echo` again.
+          # Merge commits have time-dependent IDs. Reuse a prior branch only
+          # when its source tree matches and it contains both exact parents.
+          REMOTE=$(git ls-remote --heads origin "refs/heads/$BRANCH")
+          if [ -n "$REMOTE" ]; then
+            git fetch --no-tags origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+            git merge-base --is-ancestor "$UPSTREAM_SHA" "origin/$BRANCH"
+            git merge-base --is-ancestor "$BASE_SHA" "origin/$BRANCH"
+            [ "$(git rev-parse 'HEAD^{tree}')" = "$(git rev-parse "origin/$BRANCH^{tree}")" ] || {
+              echo "::error::Existing sync branch differs; review it without overwriting"; exit 1;
+            }
+          else
+            # Never force-push. Permission errors remain visible and stop here.
+            git push origin "HEAD:refs/heads/$BRANCH"
+          fi
           gh label create upstream-sync --repo "$REPO" \
             --color 0E8A16 --description "Automated upstream stable-release sync" --force
-          PR=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
-                 --json number -q '.[0].number')
+          PRS=$(gh pr list --repo "$REPO" --head "$BRANCH" --base "$BASE_BRANCH" \
+            --state all --json number,state)
+          PR=$(jq -r '[.[] | select(.state == "OPEN")][0].number // empty' <<< "$PRS")
           if [ -z "$PR" ]; then
-            gh pr create --repo "$REPO" \
-              --base "$BASE_BRANCH" --head "$BRANCH" \
-              --title "sync: upstream ${{ steps.target.outputs.ref }}" \
-              --body "Automated rebase of our patch-overlay onto safe release \`${{ steps.target.outputs.ref }}\`. Auto-merges once \`build-test\` is green; fork-auto-release then tags and publishes the image." \
-              --label upstream-sync
-            PR=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
-                   --json number -q '.[0].number')
+            [ "$(jq length <<< "$PRS")" -eq 0 ] || {
+              echo "A reviewed sync PR was already closed; leaving that decision intact."; exit 0;
+            }
+            BODY=$(printf 'Stable upstream `%s` at `%s`, merged into fork `%s`.\n\nIndependent review and passing CI are required. No automatic merge is requested. Check publication and server-update triggers before merging; server-affecting releases need explicit approval.\n' "$REF" "$UPSTREAM_SHA" "$BASE_SHA")
+            gh pr create --repo "$REPO" --base "$BASE_BRANCH" --head "$BRANCH" \
+              --title "sync: upstream $REF" --body "$BODY" --label upstream-sync
           fi
-          # Routine stable-release syncs are zero-touch: merge when checks pass.
-          # Feature PRs keep the human gate — this only touches sync/upstream-*.
-          gh pr merge "$PR" --repo "$REPO" --auto --merge
-          # GITHUB_TOKEN-created PRs never fire pull_request workflows, so the
-          # required check would never report and auto-merge would stall —
-          # dispatch the CI gate on the branch explicitly.
-          gh workflow run fork-build-test.yml --repo "$REPO" --ref "$BRANCH"
+          # Token-created PRs do not trigger pull_request CI. Dispatch on the
+          # published branch; the coordinator must verify the exact PR SHA.
+          PUBLISHED_SHA=$(git ls-remote --heads origin "refs/heads/$BRANCH" | cut -f1)
+          [[ "$PUBLISHED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          RUNS=$(gh run list --repo "$REPO" --workflow fork-build-test.yml \
+            --branch "$BRANCH" --commit "$PUBLISHED_SHA" --limit 20 --json status,conclusion)
+          if jq -e 'any(.[]; .conclusion == "success" or .status != "completed")' <<< "$RUNS" >/dev/null; then
+            echo "CI already passed or is pending for $PUBLISHED_SHA."
+          else
+            gh workflow run fork-build-test.yml --repo "$REPO" --ref "$BRANCH"
+          fi
 
-      - name: Surface conflict as a tracking issue (and fail)
-        if: steps.gate.outputs.up_to_date != 'true' && steps.rebase.outputs.status == 'conflict'
+      - name: Track conflict once and fail visibly
+        if: steps.gate.outputs.up_to_date != 'true' && steps.integrate.outputs.status == 'conflict'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF: ${{ steps.target.outputs.ref }}
+          UPSTREAM_SHA: ${{ steps.target.outputs.upstream_sha }}
+          BASE_SHA: ${{ steps.target.outputs.base_sha }}
         run: |
-          # --repo is required everywhere: the runner has an `upstream` remote,
-          # so a bare gh would target the UPSTREAM repo (403 / wrong repo).
-          # Requires Issues enabled on the fork (forks default to disabled).
+          set -euo pipefail
           REPO="$GITHUB_REPOSITORY"
-          TITLE="sync conflict: upstream ${{ steps.target.outputs.ref }}"
-          # Ensure the label exists (idempotent) before using it.
+          TITLE="sync conflict: upstream $REF"
           gh label create upstream-sync-conflict --repo "$REPO" \
-            --color B60205 --description "Upstream sync needs manual rebase" --force || true
-          BODY=$(printf 'The nightly upstream sync could not rebase our patch-overlay onto the safe release `%s` cleanly — manual resolution needed.\n\nReproduce locally:\n```\ngit fetch upstream --tags\ngit checkout -B sync/upstream-%s origin/%s\ngit rebase %s\n# resolve conflicts, then open a PR against %s\n```\n' \
-            "${{ steps.target.outputs.ref }}" "${{ steps.target.outputs.ref }}" "$BASE_BRANCH" "${{ steps.target.outputs.ref }}" "$BASE_BRANCH")
-          EXISTING=$(gh issue list --repo "$REPO" --label upstream-sync-conflict --state open \
-                       --search "$TITLE in:title" --json number -q '.[0].number' 2>/dev/null || true)
-          if [ -n "$EXISTING" ]; then
-            echo "Conflict issue #$EXISTING already open — leaving a note."
-            gh issue comment "$EXISTING" --repo "$REPO" --body "Still conflicting as of $(date -u +%F)."
+            --color B60205 --description "Upstream sync needs conflict resolution" --force
+          ISSUES=$(gh issue list --repo "$REPO" --label upstream-sync-conflict \
+            --state open --search "$TITLE in:title" --json number,title --limit 100)
+          EXISTING=$(jq -r --arg title "$TITLE" '[.[] | select(.title == $title)][0].number // empty' <<< "$ISSUES")
+          if [ -z "$EXISTING" ]; then
+            BODY=$(printf 'Stable upstream `%s` (`%s`) conflicts with fork `%s`. Resolve the patch overlay in a reviewed PR.\n\nRun: https://github.com/%s/actions/runs/%s\n' "$REF" "$UPSTREAM_SHA" "$BASE_SHA" "$REPO" "$GITHUB_RUN_ID")
+            gh issue create --repo "$REPO" --title "$TITLE" \
+              --label upstream-sync-conflict --body "$BODY"
           else
-            gh issue create --repo "$REPO" --title "$TITLE" --label upstream-sync-conflict --body "$BODY"
+            echo "Conflict remains tracked in #$EXISTING; no repeated comment."
           fi
-          echo "::error::Rebase onto ${{ steps.target.outputs.ref }} conflicts — see the upstream-sync-conflict issue."
+          echo "::error::Upstream sync requires conflict resolution"
           exit 1
