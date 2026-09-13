@@ -28,7 +28,7 @@ jobs:
           python test/test-fork-release.py
 
   ci:
-    uses: NotCavnfox/.github/.github/workflows/build-test.yml@main
+    uses: NotCavnfox/.github/.github/workflows/build-test.yml@a8e0e929d86e9790c81f415c5276e98643945cc4
     permissions:
       contents: read
       packages: write
