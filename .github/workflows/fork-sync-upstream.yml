@@ -88,8 +88,8 @@ jobs:
             echo "up_to_date=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Rebase patch overlay
-        id: rebase
+      - name: Merge stable upstream while preserving fork history
+        id: integrate
         if: steps.gate.outputs.up_to_date != 'true'
         env:
           UPSTREAM_SHA: ${{ steps.target.outputs.upstream_sha }}
@@ -98,18 +98,18 @@ jobs:
         run: |
           set -euo pipefail
           git checkout -b "$BRANCH" "$BASE_SHA"
-          if git rebase --empty=drop "$UPSTREAM_SHA"; then
+          if git merge --no-ff --no-edit "$UPSTREAM_SHA"; then
             echo "status=clean" >> "$GITHUB_OUTPUT"
           else
             # Distinguish actual conflicts from other Git failures.
             CONFLICTS=$(git diff --name-only --diff-filter=U)
-            git rebase --abort
-            [ -n "$CONFLICTS" ] || { echo "::error::Rebase failed without conflicts"; exit 1; }
+            git merge --abort
+            [ -n "$CONFLICTS" ] || { echo "::error::Merge failed without conflicts"; exit 1; }
             echo "status=conflict" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Publish or reuse sync PR for independent review
-        if: steps.gate.outputs.up_to_date != 'true' && steps.rebase.outputs.status == 'clean'
+        if: steps.gate.outputs.up_to_date != 'true' && steps.integrate.outputs.status == 'clean'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REF: ${{ steps.target.outputs.ref }}
@@ -119,12 +119,13 @@ jobs:
         run: |
           set -euo pipefail
           REPO="$GITHUB_REPOSITORY"
-          # Rebases have time-dependent commit IDs. Reuse a prior branch only
-          # when its source tree matches and it contains the exact upstream.
+          # Merge commits have time-dependent IDs. Reuse a prior branch only
+          # when its source tree matches and it contains both exact parents.
           REMOTE=$(git ls-remote --heads origin "refs/heads/$BRANCH")
           if [ -n "$REMOTE" ]; then
             git fetch --no-tags origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
             git merge-base --is-ancestor "$UPSTREAM_SHA" "origin/$BRANCH"
+            git merge-base --is-ancestor "$BASE_SHA" "origin/$BRANCH"
             [ "$(git rev-parse 'HEAD^{tree}')" = "$(git rev-parse "origin/$BRANCH^{tree}")" ] || {
               echo "::error::Existing sync branch differs; review it without overwriting"; exit 1;
             }
@@ -141,7 +142,7 @@ jobs:
             [ "$(jq length <<< "$PRS")" -eq 0 ] || {
               echo "A reviewed sync PR was already closed; leaving that decision intact."; exit 0;
             }
-            BODY=$(printf 'Stable upstream `%s` at `%s`, rebased from fork `%s`.\n\nIndependent review and passing CI are required. No automatic merge is requested. Check publication and server-update triggers before merging; server-affecting releases need explicit approval.\n' "$REF" "$UPSTREAM_SHA" "$BASE_SHA")
+            BODY=$(printf 'Stable upstream `%s` at `%s`, merged into fork `%s`.\n\nIndependent review and passing CI are required. No automatic merge is requested. Check publication and server-update triggers before merging; server-affecting releases need explicit approval.\n' "$REF" "$UPSTREAM_SHA" "$BASE_SHA")
             gh pr create --repo "$REPO" --base "$BASE_BRANCH" --head "$BRANCH" \
               --title "sync: upstream $REF" --body "$BODY" --label upstream-sync
           fi
@@ -158,7 +159,7 @@ jobs:
           fi
 
       - name: Track conflict once and fail visibly
-        if: steps.gate.outputs.up_to_date != 'true' && steps.rebase.outputs.status == 'conflict'
+        if: steps.gate.outputs.up_to_date != 'true' && steps.integrate.outputs.status == 'conflict'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REF: ${{ steps.target.outputs.ref }}
@@ -169,7 +170,7 @@ jobs:
           REPO="$GITHUB_REPOSITORY"
           TITLE="sync conflict: upstream $REF"
           gh label create upstream-sync-conflict --repo "$REPO" \
-            --color B60205 --description "Upstream sync needs manual rebase" --force
+            --color B60205 --description "Upstream sync needs conflict resolution" --force
           ISSUES=$(gh issue list --repo "$REPO" --label upstream-sync-conflict \
             --state open --search "$TITLE in:title" --json number,title --limit 100)
           EXISTING=$(jq -r --arg title "$TITLE" '[.[] | select(.title == $title)][0].number // empty' <<< "$ISSUES")

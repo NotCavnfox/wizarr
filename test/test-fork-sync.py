@@ -191,6 +191,18 @@ os.execv(os.environ['REAL_GIT'], [os.environ['REAL_GIT']] + sys.argv[1:])
         self.run_step(4, expected=1)
         self.assertEqual(self.git(self.origin, 'rev-parse', 'refs/heads/' + branch), divergent)
 
+    def test_same_tree_without_fork_history_is_rejected(self):
+        self.histories()
+        self.prepare()
+        branch = self.env['BRANCH']
+        tree = self.git(self.work, 'rev-parse', 'HEAD^{tree}')
+        rewritten = self.git(self.work, 'commit-tree', tree,
+                             '-p', self.env['UPSTREAM_SHA'], '-m', 'same tree without fork history')
+        self.git(self.work, 'push', 'origin', rewritten + ':refs/heads/' + branch)
+        self.run_step(4, expected=1)
+        self.assertEqual(self.git(self.origin, 'rev-parse', 'refs/heads/' + branch), rewritten)
+        self.assertFalse(any(c[:2] in [['pr', 'create'], ['workflow', 'run']] for c in self.gh_calls()))
+
     def test_conflict_issue_reused_without_comment(self):
         self.histories(conflict=True)
         self.prepare()

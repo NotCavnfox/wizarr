@@ -14,6 +14,7 @@ env:
 
 jobs:
   docker-dev:
+    if: github.repository == 'wizarrrr/wizarr'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: read
