@@ -7,10 +7,24 @@ on:
     branches: [main]
   # fork-sync-upstream dispatches this on sync branches: PRs created with
   # GITHUB_TOKEN never fire pull_request workflows, so the required check
-  # would otherwise never report and auto-merge would wait forever.
+  # would otherwise never report for independent review.
   workflow_dispatch:
 
 jobs:
+  sync-workflow-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install PyYAML==6.0.2
+      - run: python test/test-fork-sync.py
+
   ci:
     uses: NotCavnfox/.github/.github/workflows/build-test.yml@main
     permissions:
@@ -21,4 +35,4 @@ jobs:
       smoke_port: 5690
       smoke_path: /
       compose_test: true
-      publish_edge: true
+      publish_edge: false
