@@ -1,22 +1,30 @@
-# When the base branch contains the latest stable upstream release but the
-# fork has no matching tag yet: tag HEAD and dispatch fork-release.
-#
-# Why a schedule sweep and not just tag-on-merge: sync PRs are merged by
-# auto-merge under GITHUB_TOKEN, and GITHUB_TOKEN-caused events never trigger
-# workflows. The pull_request trigger below catches *manual* merges instantly;
-# the schedule reliably catches bot merges within 2 hours.
+# Prepare a release only after the owner approves an exact revision and tag.
+# Source merges and scheduled syncs never dispatch publication automatically.
 name: fork-auto-release
 
 on:
-  schedule:
-    - cron: "41 */2 * * *"
   workflow_dispatch:
-  pull_request:
-    types: [closed]
+    inputs:
+      upstream_tag:
+        description: Published stable upstream tag (vX.Y.Z)
+        required: true
+        type: string
+      release_tag:
+        description: Approved fork tag (upstream tag, optionally followed by -fork.N)
+        required: true
+        type: string
+      release_sha:
+        description: Approved full 40-character source SHA with passing fork CI
+        required: true
+        type: string
 
 permissions:
   contents: write
   actions: write
+
+concurrency:
+  group: fork-release-publication
+  cancel-in-progress: false
 
 env:
   UPSTREAM_REPO: wizarrrr/wizarr
@@ -25,62 +33,54 @@ env:
 jobs:
   tag-and-release:
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || (github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'sync/upstream-'))
     steps:
       - uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
-
-      - name: Resolve latest stable upstream release
-        id: rel
+      - name: Verify approved release and passing CI
+        id: release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          REF=$(gh release list --repo "$UPSTREAM_REPO" --exclude-drafts --exclude-pre-releases \
-                  --limit 1 --json tagName -q '.[0].tagName')
-          if [ -z "$REF" ]; then
-            echo "::error::Could not resolve a stable upstream release for $UPSTREAM_REPO"
-            exit 1
-          fi
-          echo "ref=$REF" >> "$GITHUB_OUTPUT"
-          echo "Latest stable upstream release: $REF"
-
-      - name: Gate — base synced to release and fork not yet tagged?
-        id: gate
-        run: |
-          REF="${{ steps.rel.outputs.ref }}"
-          # Fork already released this version → nothing to do.
-          if git ls-remote --exit-code --tags origin "refs/tags/$REF" >/dev/null 2>&1; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Fork already tagged $REF."
-            exit 0
-          fi
-          # Fetch the upstream tag to a neutral ref so it can't clobber ours.
-          git remote add upstream "https://github.com/$UPSTREAM_REPO.git" 2>/dev/null || true
-          if ! git fetch -q --no-tags upstream "+refs/tags/$REF:refs/upsync/$REF"; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Upstream tag $REF not fetchable."
-            exit 0
-          fi
-          if ! git merge-base --is-ancestor "refs/upsync/$REF" HEAD; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Base branch not yet synced to $REF — waiting on fork-sync-upstream."
-            exit 0
-          fi
-          echo "skip=false" >> "$GITHUB_OUTPUT"
-
-      - name: Tag and dispatch release build
-        if: steps.gate.outputs.skip == 'false'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
         run: |
           set -euo pipefail
-          REF="${{ steps.rel.outputs.ref }}"
+          [[ "$UPSTREAM_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "$RELEASE_TAG" != "$UPSTREAM_TAG" ]]; then
+            SUFFIX=${RELEASE_TAG#"$UPSTREAM_TAG"}
+            [[ "$RELEASE_TAG" == "$UPSTREAM_TAG"* && "$SUFFIX" =~ ^-fork\.[1-9][0-9]*$ ]]
+          fi
+          RELEASE=$(gh api "repos/$UPSTREAM_REPO/releases/tags/$UPSTREAM_TAG")
+          jq -e --arg tag "$UPSTREAM_TAG" '(.tag_name == $tag) and (.draft == false) and (.prerelease == false) and (.published_at != null)' <<< "$RELEASE" >/dev/null
+          git fetch --no-tags "https://github.com/$UPSTREAM_REPO.git" "refs/tags/$UPSTREAM_TAG:refs/upsync/release"
+          git cat-file -e "$RELEASE_SHA^{commit}"
+          git merge-base --is-ancestor "$RELEASE_SHA" "origin/$BASE_BRANCH"
+          git merge-base --is-ancestor 'refs/upsync/release^{commit}' "$RELEASE_SHA"
+          # The tag dispatch executes workflow code at the selected commit.
+          # Do not release older code through a different/obsolete publisher.
+          [[ "$(git rev-parse "$RELEASE_SHA:.github/workflows/fork-release.yml")" == "$(git rev-parse "origin/$BASE_BRANCH:.github/workflows/fork-release.yml")" ]]
+          RUNS=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow fork-build-test.yml --commit "$RELEASE_SHA" --limit 1 --json status,conclusion)
+          jq -e '.[0] | .status == "completed" and .conclusion == "success"' <<< "$RUNS" >/dev/null || {
+            echo "::error::Latest fork CI is not successful for the approved exact SHA"; exit 1;
+          }
+          printf 'tag=%s\nsha=%s\n' "$RELEASE_TAG" "$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+      - name: Create immutable tag and dispatch publisher
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          EXISTING=$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")
+          if [[ -n "$EXISTING" ]]; then
+            echo "::error::Release tag already exists; verify its prior publication instead of moving or republishing it"
+            exit 1
+          fi
           git config user.name "fork-release-bot"
           git config user.email "fork-release-bot@users.noreply.github.com"
-          git tag -a "$REF" -m "Fork release: upstream $REF + patch overlay" HEAD
-          git push origin "refs/tags/$REF"
-          # Token-pushed tags don't fire on:push — dispatch the build explicitly.
-          gh workflow run fork-release.yml --repo "$GITHUB_REPOSITORY" --ref "$REF"
-          echo "Tagged $REF and dispatched fork-release."
+          git tag -a "$RELEASE_TAG" -m "Reviewed fork release $RELEASE_SHA" "$RELEASE_SHA"
+          git push origin "refs/tags/$RELEASE_TAG"
+          gh workflow run fork-release.yml --repo "$GITHUB_REPOSITORY" --ref "$RELEASE_TAG"

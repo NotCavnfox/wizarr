@@ -8,6 +8,7 @@ on:
 
 jobs:
   build:
+    if: github.repository == 'wizarrrr/wizarr'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     env:
       GH_TOKEN: ${{ secrets.SPONSORS_TOKEN }}
