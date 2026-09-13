@@ -18,8 +18,8 @@ permissions:
 
 jobs:
   sync:
-    # Replace the marker only with the reviewed, merged shared commit SHA.
-    uses: NotCavnfox/.github/.github/workflows/sync-upstream.yml@8554d67712f5e6565831431a876c6f08e04cdb13
+    # Pin the reviewed, merged shared revision.
+    uses: NotCavnfox/.github/.github/workflows/sync-upstream.yml@fe15ddf831801f4c8215141217fec0afb9d22533
     with:
       upstream_repo: wizarrrr/wizarr
       base_branch: main
