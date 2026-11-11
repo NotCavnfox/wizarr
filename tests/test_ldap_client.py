@@ -111,6 +111,91 @@ def test_create_user_success(mock_server, mock_connection, ldap_config):
 
 @patch("app.services.ldap.client.Connection")
 @patch("app.services.ldap.client.Server")
+def test_create_user_sends_schema_required_cn_and_sn(
+    mock_server, mock_connection, ldap_config
+):
+    """Schema-strict servers reject an inetOrgPerson without cn and sn."""
+    mock_conn = MagicMock()
+    mock_conn.add.return_value = True
+    mock_conn.extend.standard.modify_password.return_value = True
+    mock_conn.entries = []
+    mock_connection.return_value = mock_conn
+
+    LDAPClient(ldap_config).create_user(
+        username="newuser", email="newuser@example.com", password="password123"
+    )
+
+    attrs = mock_conn.add.call_args.kwargs["attributes"]
+    assert attrs == {
+        "objectClass": ["inetOrgPerson"],
+        "uid": "newuser",
+        "mail": "newuser@example.com",
+        "cn": "newuser",
+        "sn": "newuser",
+    }
+
+
+@patch("app.services.ldap.client.Connection")
+@patch("app.services.ldap.client.Server")
+def test_create_user_keeps_mapped_cn(mock_server, mock_connection, ldap_config):
+    """A username mapped to cn is not replaced by the schema default."""
+    ldap_config.username_attribute = "cn"
+    mock_conn = MagicMock()
+    mock_conn.add.return_value = True
+    mock_conn.extend.standard.modify_password.return_value = True
+    mock_conn.entries = []
+    mock_connection.return_value = mock_conn
+
+    LDAPClient(ldap_config).create_user(
+        username="newuser", email="newuser@example.com", password="password123"
+    )
+
+    attrs = mock_conn.add.call_args.kwargs["attributes"]
+    assert attrs["cn"] == "newuser"
+    assert attrs["sn"] == "newuser"
+    assert "uid" not in attrs
+
+
+@patch("app.services.ldap.client.Connection")
+@patch("app.services.ldap.client.Server")
+def test_create_user_writes_lowercase_uid_and_dn(
+    mock_server, mock_connection, ldap_config
+):
+    """LLDAP rejects a DN with uppercase letters, and a uid that differs from it."""
+    ldap_config.user_base_dn = "ou=People,dc=Example,dc=com"
+    mock_conn = MagicMock()
+    mock_conn.add.return_value = True
+    mock_conn.extend.standard.modify_password.return_value = True
+    mock_conn.entries = []
+    mock_connection.return_value = mock_conn
+
+    success, user_dn = LDAPClient(ldap_config).create_user(
+        username="JohnDoe", email="john@example.com", password="password123"
+    )
+
+    assert success is True
+    assert user_dn == "uid=johndoe,ou=people,dc=example,dc=com"
+    assert mock_conn.add.call_args.args[0] == user_dn
+    assert mock_conn.add.call_args.kwargs["attributes"]["uid"] == "johndoe"
+
+
+@patch("app.services.ldap.client.Connection")
+@patch("app.services.ldap.client.Server")
+def test_find_user_dn_searches_lowercase_username(
+    mock_server, mock_connection, ldap_config
+):
+    """A lookup uses the same lowercase uid that create_user writes."""
+    mock_conn = MagicMock()
+    mock_conn.entries = []
+    mock_connection.return_value = mock_conn
+
+    LDAPClient(ldap_config).find_user_dn("JohnDoe")
+
+    assert mock_conn.search.call_args.kwargs["search_filter"] == "(uid=johndoe)"
+
+
+@patch("app.services.ldap.client.Connection")
+@patch("app.services.ldap.client.Server")
 def test_search_groups(mock_server, mock_connection, ldap_config):
     mock_conn = MagicMock()
     mock_conn.search.return_value = True
